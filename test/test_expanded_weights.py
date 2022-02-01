@@ -204,8 +204,9 @@ class TestExpandedWeightFunctional(TestCase):
             func = partial(run_op, op)
             repeated_input = input.unsqueeze(0).expand(2, *input.shape).reshape(2 * input.shape[0], *input.shape[1:])
             per_sample_grad = for_loop_per_sample_grad(2 * batch_size, repeated_input, func, *args, **kwargs)
-            per_sample_input = per_sample_grad[0].reshape(2, *input.shape).sum(0)  # mimics the accumulation from running twice
-            per_sample_grad = (per_sample_input, *per_sample_grad[1:])
+            if op.name != "nn.functional.embedding":  # embedding's input is not differentiable
+                per_sample_input = per_sample_grad[0].reshape(2, *input.shape).sum(0)
+                per_sample_grad = (per_sample_input, *per_sample_grad[1:])
 
             # check equality
             self.assertEqual(len(per_sample_grad), len(expanded_weight_grad))
@@ -253,7 +254,7 @@ class TestExpandedWeightFunctional(TestCase):
 
 
 class TestExpandedWeightModule(TestCase):
-    def _do_test(self, module, input):
+    def _do_test(self, module, input, atol=None):
         if sum(1 for _ in module.parameters()) == 0:  # for norms with affine=False
             return
         batch_size = input.shape[0]
@@ -275,9 +276,12 @@ class TestExpandedWeightModule(TestCase):
                 expected_res += res
             expected_grads = tuple(torch.stack(grad) for grad in zip(*expected_grads))
         self.assertEqual(actual_res, expected_res)
-        assert [torch.allclose(actual, expected) for (actual, expected) in zip(actual_grads, expected_grads)]
+        if atol is not None:
+            assert [torch.allclose(actual, expected, atol=atol) for (actual, expected) in zip(actual_grads, expected_grads)]
+        else:
+            assert [torch.allclose(actual, expected) for (actual, expected) in zip(actual_grads, expected_grads)]
 
-    def _do_test_multi_input(self, module, input):
+    def _do_test_multi_input(self, module, input, atol=None):
         if sum(1 for _ in module.parameters()) == 0:  # for norms with affine=False
             return
         batch_size = input.shape[0]
@@ -299,7 +303,10 @@ class TestExpandedWeightModule(TestCase):
                 res = module(input[i % batch_size].unsqueeze(0)).sum()
                 expected_grads.append(torch.autograd.grad(res, module.parameters(), torch.ones_like(res)))
             expected_grads = tuple(torch.stack(grad) for grad in zip(*expected_grads))
-        assert [torch.allclose(actual, expected) for (actual, expected) in zip(actual_grads, expected_grads)]
+        if atol is not None:
+            assert [torch.allclose(actual, expected, atol=atol) for (actual, expected) in zip(actual_grads, expected_grads)]
+        else:
+            assert [torch.allclose(actual, expected) for (actual, expected) in zip(actual_grads, expected_grads)]
 
 class ContextManagerTests(TestBase):
     def __init__(self, *args, **kwargs):
@@ -309,26 +316,26 @@ class ContextManagerTests(TestBase):
     def constructor_args(self):
         return self._get_arg('constructor_args', False)
 
-    def test_context_manager(self, test_case):
+    def test_context_manager(self, test_case, atol=None):
         module = self.constructor(*self.constructor_args)
         input = self._get_input()
         if len(input.shape) == 0 or input.shape[0] == 0:
             return
         if self.constructor == torch.nn.Linear and len(input.shape) == 1:
             return
-        test_case._do_test(module, input)
+        test_case._do_test(module, input, atol=atol)
 
-    def test_context_manager_multiple_inputs(self, test_case):
+    def test_context_manager_multiple_inputs(self, test_case, atol=None):
         module = self.constructor(*self.constructor_args)
         input = self._get_input()
         if len(input.shape) == 0 or input.shape[0] == 0:
             return
         if self.constructor == torch.nn.Linear and len(input.shape) == 1:
             return
-        test_case._do_test_multi_input(module, input)
+        test_case._do_test_multi_input(module, input, atol=atol)
 
 # TODO: Once all of these use ModuleInfo, replace with ModuleInfo tests
-supported_modules = ['Linear']
+supported_modules = ['Linear', 'Conv1d', 'Conv2d', 'Conv3d', 'GroupNorm', 'LayerNorm', 'InstanceNorm', 'Embedding']
 supported_tests = [t for t in module_tests + new_module_tests if 'module_name' in t and t['module_name'] in supported_modules]
 for test_param in supported_tests:
     if 'constructor' not in test_param:
@@ -344,9 +351,13 @@ for test_param in supported_tests:
         raise RuntimeError('Found two tests with the same name: ' + test_name)
     if decorator is not None:
         fn = decorator(fn)
-    setattr(TestExpandedWeightModule, test_name, lambda self, test=test: test.test_context_manager(self))
+
+    atol = None
+    if test_name == "GroupNorm_2d_affine_large_feature":
+        atol = 1e-05
+    setattr(TestExpandedWeightModule, test_name, lambda self, test=test, atol=atol: test.test_context_manager(self, atol=atol))
     setattr(TestExpandedWeightModule, test_name_multi_input,
-            lambda self, test=test: test.test_context_manager_multiple_inputs(self))
+            lambda self, test=test, atol=atol: test.test_context_manager_multiple_inputs(self, atol=atol))
 
 # ------------- HELPER FUNCTIONS -----------------
 
@@ -376,12 +387,13 @@ def supported_inputs(op, sample_inputs, supported_inputs=True):
     operations that would cause inter-batch operations. Removes all of the cases it cannot deal with
     """
     def filter_fn(input):
+        convolutions = ["nn.functional.conv1d", "nn.functional.conv2d", "nn.functional.conv3d"]
         if op.name == "nn.functional.linear":
             is_supported_input = len(input.input.shape) > 1  # input of rank 1 means no batch dim
         elif op.name == "nn.functional.layer_norm":
             normalized_shape = input.args[0]
             is_supported_input = input.input.shape != normalized_shape  # would cause inter-batch operations
-        elif op.name == "nn.functional.conv2d":
+        elif op.name in convolutions:
             # currently can't deal with padding computation on Python level
             is_supported_input = 'padding' not in input.kwargs or not isinstance(input.kwargs['padding'], str)
         elif op.name == "nn.functional.embedding":

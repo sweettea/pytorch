@@ -6292,6 +6292,8 @@ def sample_inputs_mvlgamma(op_info, device, dtype, requires_grad, **kwargs):
         if not dtype.is_floating_point:
             # Round-up minimum value for integral dtypes
             min_val += 1
+        else:
+            min_val += 2 * torch.finfo(dtype).eps
         yield SampleInput(make_arg(shape, low=min_val), args=(n,))
 
 

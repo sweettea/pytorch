@@ -10,11 +10,7 @@ from pathlib import Path
 from typing import cast, Any, BinaryIO, Callable, Dict, List, Optional, Union, Type
 from weakref import WeakValueDictionary
 
-import torch
-from torch.serialization import _get_restore_location, _maybe_decode_ascii
-
 from ._directory_reader import DirectoryReader
-from ._directory_reader_torchscript import TorchScriptDirectoryReader
 from ._importlib import (
     _calc___package__,
     _normalize_line_endings,
@@ -27,16 +23,15 @@ from ._package_unpickler import PackageUnpickler
 from .file_structure_representation import Directory, _create_directory_from_file_list
 from .glob_group import GlobPattern
 from .importer import Importer
-from ._zip_file import PackageZipFileReader
-from ._zip_file_torchscript import TorchScriptPackageZipFileReader
+from ._zip_file import PackageZipFileReader, DefaultPackageZipFileReader
 
 
 class PackageImporter(Importer):
     """Importers allow you to load code written to packages by :class:`PackageExporter`.
     Code is loaded in a hermetic way, using files from the package
     rather than the normal python import system. This allows
-    for the packaging of PyTorch model code and data so that it can be run
-    on a server or used in the future for transfer learning.
+    for the packaging of python code and data so that it can be run
+    on a server or used in the future.
 
     The importer for packages ensures that code in the module can only be loaded from
     within the package, except for modules explicitly listed as external during export.
@@ -52,9 +47,10 @@ class PackageImporter(Importer):
 
     def __init__(
         self,
-        file_or_buffer: Union[str, torch._C.PyTorchFileReader, PackageZipFileReader, Path, BinaryIO],
+        file_or_buffer: Union[str, PackageZipFileReader, Path, BinaryIO],
         module_allowed: Callable[[str], bool] = lambda module_name: True,
-        zip_file_reader_type: Type[PackageZipFileReader] = TorchScriptPackageZipFileReader
+        zip_file_reader_type: Type[PackageZipFileReader] = DefaultPackageZipFileReader,
+        directory_reader_type: Type[PackageZipFileReader] = DirectoryReader,
     ):
         """Open ``file_or_buffer`` for importing. This checks that the imported package only requires modules
         allowed by ``module_allowed``
@@ -70,18 +66,19 @@ class PackageImporter(Importer):
             ImportError: If the package will use a disallowed module.
         """
         self.zip_reader: Any
-        if isinstance(file_or_buffer, torch._C.PyTorchFileReader):
-            self.filename = "<pytorch_file_reader>"
+        if isinstance(file_or_buffer, PackageZipFileReader):
+            self.filename = "<package_file_reader>"
             self.zip_reader = file_or_buffer
         elif isinstance(file_or_buffer, (Path, str)):
             self.filename = str(file_or_buffer)
             if not os.path.isdir(self.filename):
                 self.zip_reader = zip_file_reader_type(self.filename)
             else:
-                self.zip_reader = TorchScriptDirectoryReader(self.filename)
+                # TODO: should we deprecate directory_reader_type and wrap into into zip_file_reader?
+                self.zip_reader = directory_reader_type(self.filename)
         else:
             self.filename = "<binary>"
-            self.zip_reader = TorchScriptPackageZipFileReader(file_or_buffer)
+            self.zip_reader = zip_file_reader_type(file_or_buffer)
         self.root = _PackageNode(None)
         self.modules = {}
         self.extern_modules = self._read_extern()
@@ -108,7 +105,6 @@ class PackageImporter(Importer):
         self.storage_context: Any = None
         self.last_map_location = None
 
-        # used for torch.serialization._load
         self.Unpickler = lambda *args, **kwargs: PackageUnpickler(self, *args, **kwargs)
 
     def import_module(self, name: str, package=None):
@@ -245,7 +241,7 @@ class PackageImporter(Importer):
         unpickler = self.Unpickler(data_file)
         unpickler.persistent_load = persistent_load
 
-        # TODO: it might make sense to have a seperate packager in torch which uses the OSS pacakge but saves state
+        # TODO: it might make sense to have a seperate packager in torch which uses the OSS package but saves state
         @contextmanager
         def set_deserialization_context():
             # to let reduce_package access deserializaiton context
